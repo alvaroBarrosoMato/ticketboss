@@ -13,10 +13,11 @@ install. Drop it on GitHub Pages and it works.
 
 ```
 ticketboss/
-├── index.html        # the entire app (Tailwind + React 18 + Babel, all inline)
+├── index.html         # the entire app (Tailwind + React 18 + Babel + Braze, all inline)
+├── service-worker.js  # Braze web-push service worker
 ├── assets/
-│   └── logo.svg      # the mark, also inlined in index.html as <LogoMark />
-├── .nojekyll         # stops GitHub Pages from running Jekyll over the files
+│   └── logo.svg       # the mark, also inlined in index.html as <LogoMark />
+├── .nojekyll          # stops GitHub Pages from running Jekyll over the files
 └── README.md
 ```
 
@@ -69,6 +70,115 @@ and `rounded-4xl`.
 | **Search** | Sticky search bar, sidebar filters (category / date / max price / city) that collapse into a bottom sheet on mobile, active-filter chips, sort dropdown, result count, empty state |
 | **My events** | Saved vs. Going tabs, summary stat cards, "next up" feature card, per-card Going toggle, total-if-bought footer |
 | **My tickets** | Dark wallet summary, Upcoming/Past tabs, digital passes with generated QR codes, perforated tear line, section/row/seat block, and a full-screen pass modal with a barcode |
+
+## Braze integration
+
+The [Braze Web SDK](https://www.braze.com/docs/developer_guide/sdk_integration?sdktab=web)
+**6.13** is loaded from the CDN in `index.html`, above the app script:
+
+```html
+<script src="https://js.appboycdn.com/web-sdk/6.13/braze.min.js"></script>
+```
+
+Configuration lives in one object at the top of section 2 of the script block:
+
+```js
+const BRAZE = {
+  apiKey:  '6c30e0b3-6ded-45c8-9a8d-7eadbb065447',  // SDK key — public by design
+  baseUrl: 'sdk.fra-02.braze.eu',                   // EU-02 cluster
+  version: '6.13'
+};
+```
+
+Initialisation follows the documented order — `changeUser` **before** `openSession`:
+
+```js
+sdk.initialize(BRAZE.apiKey, {
+  baseUrl: BRAZE.baseUrl,
+  enableLogging: new URLSearchParams(location.search).has('brazeLog'),
+  allowUserSuppliedJavascript: true,
+  serviceWorkerLocation: './service-worker.js'
+});
+sdk.automaticallyShowInAppMessages();
+sdk.changeUser(brazeUserId());
+sdk.openSession();
+```
+
+### The `bz` wrapper
+
+Nothing in the UI touches the SDK directly. Everything goes through `bz`, a thin
+wrapper where **every call is inside a try/catch and a `brazeReady` guard**. Ad
+blockers block `js.appboycdn.com` routinely, so "SDK absent" is a normal state,
+not an error path — when it happens, analytics silently no-ops and the site is
+otherwise identical. The footer shows which state you're in.
+
+### What gets tracked
+
+| Custom event | Fires when |
+| --- | --- |
+| `screen_viewed` | Switching tabs (carries `from` and `screen`) |
+| `search_performed` | Query or filters settle — debounced 900 ms, includes `results_count` and `zero_results` |
+| `category_browsed` | A category card is clicked |
+| `city_changed` | The city selector changes |
+| `event_viewed` | An event detail modal opens |
+| `event_saved` / `event_unsaved` | Heart toggled |
+| `marked_going` / `unmarked_going` | Going toggled |
+| `ticket_purchased` | Checkout confirmed |
+| `ticket_pass_opened` | A wallet pass is opened |
+| `ticket_transfer_started`, `pass_added_to_wallet`, `event_shared`, `wallet_synced`, `membership_cta_clicked`, `content_card_clicked` | Their respective buttons |
+
+Event properties are built by one helper, `eventProps(event, extra)`, so every
+event carries the same `event_id`, `category`, `venue`, `city`, `price_from`,
+`event_date` and `days_away` shape. That consistency is what makes segmentation
+on them workable later.
+
+**Revenue** uses `logPurchase(eventId, unitAllIn, 'EUR', qty, props)`. Braze
+computes revenue as `price × quantity`, so the *all-in per-ticket* price is sent
+(tier price + booking fee), not the order total — otherwise revenue would be
+multiplied twice.
+
+**Custom attributes** are re-synced whenever the relevant state changes:
+`saved_events`, `going_events`, `tickets_owned`, `lifetime_spend`,
+`favourite_category` (derived from what's saved) and `home_city` — plus
+`setHomeCity()` on the native profile field.
+
+### Content Cards
+
+Subscribed via `subscribeToContentCardsUpdates`, surfaced in two places:
+
+- the **bell icon** in the nav, as a notification inbox with an unread badge
+- a **"Picked for you"** strip on Discover, which renders nothing at all when no
+  campaign targets the user — so the page is unchanged by default
+
+Impressions (`logContentCardImpressions`), clicks (`logContentCardClick`) and
+dismissals (`logCardDismissal`) are all wired up.
+
+### In-app messages
+
+`automaticallyShowInAppMessages()` is on, so anything you trigger from the
+dashboard displays without further code. `allowUserSuppliedJavascript: true` is
+set so HTML in-app messages work — that permits JavaScript authored in your
+Braze dashboard to run on the page, so turn it off if you don't need HTML
+messages.
+
+### Web push
+
+`service-worker.js` imports Braze's worker. The permission request is behind a
+**soft prompt** inside the bell panel rather than firing on page load, which is
+both better practice and avoids burning the one-shot browser permission.
+
+Push additionally needs HTTPS (GitHub Pages qualifies) and VAPID keys configured
+in **Braze dashboard → Settings → App Settings**. Until that's done the soft
+prompt appears but no pushes arrive.
+
+### Debugging
+
+Append `?brazeLog=1` to any URL to turn on the SDK's verbose console logging.
+You'll see each event as it's logged and each trigger evaluation.
+
+Verified working against the EU-02 cluster: events `POST` to
+`sdk.fra-02.braze.eu/api/v3/data/`, Content Cards sync, and a test purchase
+logged as `2 purchases of "ev-02" for EUR 69.50`.
 
 ## How it's built
 
@@ -123,3 +233,10 @@ stays crisp at any size and inherits the theme colour.
 - Deep links aren't wired up — navigation is component state, so there is no URL
   per view and no browser back/forward between tabs. Adding `hashchange`
   handling around `setView` is about fifteen lines if you want it.
+- Braze users are pseudonymous. There's no sign-in, so `changeUser` gets a random
+  `tb-xxxxxxxx` id persisted in `localStorage`. Clearing site data creates a new
+  profile. Wire `changeUser` to a real identity if you add auth.
+- Braze's CDN build is used rather than the npm package. Braze recommend npm —
+  it survives ad blockers and avoids Safari's *Prevent Cross-Site Tracking*
+  interfering with Content Cards and banners. The CDN keeps this a single-file
+  demo; switch to npm if any of that starts to matter.

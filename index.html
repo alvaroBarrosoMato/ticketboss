@@ -100,6 +100,12 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js" crossorigin></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+
+  <!-- Braze Web SDK. Loads before the app script so `window.braze` is ready when
+       the app initialises. If an ad blocker eats it, every analytics call in the
+       app degrades to a no-op and the UI carries on unaffected. -->
+  <script src="https://js.appboycdn.com/web-sdk/6.13/braze.min.js"></script>
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js" crossorigin></script>
 
 <script type="text/babel" data-presets="react">
@@ -163,7 +169,114 @@ const store = {
 };
 
 /* ════════════════════════════════════════════════════════════════════════
-   2. MOCK DATA
+   2. BRAZE — SDK initialisation and analytics wrapper
+   ────────────────────────────────────────────────────────────────────────
+   Every call below is wrapped so that a missing or broken SDK can never take
+   the UI down with it. Ad blockers routinely block js.appboycdn.com, so
+   `brazeReady === false` is a normal state, not an error path.
+
+   Append ?brazeLog=1 to the URL to turn on the SDK's verbose console logging.
+   ════════════════════════════════════════════════════════════════════════ */
+
+const BRAZE = {
+  apiKey:  '6c30e0b3-6ded-45c8-9a8d-7eadbb065447',  // SDK key — public by design
+  baseUrl: 'sdk.fra-02.braze.eu',                   // EU-02 cluster
+  version: '6.13'
+};
+
+/** Stable pseudonymous id so a returning visitor is the same Braze user. */
+function brazeUserId() {
+  let id = store.get('userId', null);
+  if (!id) {
+    id = 'tb-' + Math.random().toString(36).slice(2, 10);
+    store.set('userId', id);
+  }
+  return id;
+}
+
+const sdk = window.braze;
+
+const brazeReady = (() => {
+  if (!sdk) {
+    console.warn('[Ticketboss] Braze SDK did not load — analytics is a no-op. An ad blocker is the usual cause.');
+    return false;
+  }
+  try {
+    sdk.initialize(BRAZE.apiKey, {
+      baseUrl: BRAZE.baseUrl,
+      enableLogging: new URLSearchParams(location.search).has('brazeLog'),
+      // Required for HTML in-app messages. It lets JS authored in your Braze
+      // dashboard run on the page, so only keep it on if you trust your authors.
+      allowUserSuppliedJavascript: true,
+      // Relative so it resolves under the /ticketboss/ path on GitHub Pages.
+      serviceWorkerLocation: './service-worker.js'
+    });
+    sdk.automaticallyShowInAppMessages();
+    sdk.changeUser(brazeUserId());   // must precede openSession
+    sdk.openSession();
+    return true;
+  } catch (err) {
+    console.warn('[Ticketboss] Braze initialize failed:', err);
+    return false;
+  }
+})();
+
+const bz = {
+  ready: brazeReady,
+  version: BRAZE.version,
+
+  event(name, props) {
+    if (!brazeReady) return;
+    try { sdk.logCustomEvent(name, props); } catch (e) { /* never break the UI */ }
+  },
+
+  purchase(productId, unitPrice, quantity, props) {
+    if (!brazeReady) return;
+    try { sdk.logPurchase(productId, unitPrice, 'EUR', quantity, props); } catch (e) {}
+  },
+
+  attrs(map) {
+    if (!brazeReady) return;
+    try {
+      const u = sdk.getUser();
+      Object.keys(map).forEach(k => u.setCustomUserAttribute(k, map[k]));
+    } catch (e) {}
+  },
+
+  homeCity(city) {
+    if (!brazeReady) return;
+    try { sdk.getUser().setHomeCity(city); } catch (e) {}
+  },
+
+  flush() { if (brazeReady) { try { sdk.requestImmediateDataFlush(); } catch (e) {} } },
+
+  /* ── Content Cards ───────────────────────────────────────────────────── */
+  onCards(cb) {
+    if (!brazeReady) return () => {};
+    try {
+      const id = sdk.subscribeToContentCardsUpdates(feed => cb(feed.cards || []));
+      const cached = sdk.getCachedContentCards();
+      if (cached && cached.cards && cached.cards.length) cb(cached.cards);
+      sdk.requestContentCardsRefresh();
+      return () => { try { sdk.removeSubscription(id); } catch (e) {} };
+    } catch (e) { return () => {}; }
+  },
+  cardsSeen(cards) { if (brazeReady && cards.length) { try { sdk.logContentCardImpressions(cards); } catch (e) {} } },
+  cardClick(card)  { if (brazeReady) { try { sdk.logContentCardClick(card); } catch (e) {} } },
+  cardDismiss(card){ if (brazeReady) { try { sdk.logCardDismissal(card); } catch (e) {} } },
+
+  /* ── Web push ────────────────────────────────────────────────────────── */
+  pushSupported() { try { return brazeReady && sdk.isPushSupported(); } catch (e) { return false; } },
+  pushGranted()   { try { return brazeReady && sdk.isPushPermissionGranted(); } catch (e) { return false; } },
+  pushBlocked()   { try { return brazeReady && sdk.isPushBlocked(); } catch (e) { return false; } },
+  requestPush(onOk, onNo) {
+    if (!brazeReady) { onNo && onNo(); return; }
+    try { sdk.requestPushPermission(onOk, onNo); } catch (e) { onNo && onNo(); }
+  }
+};
+
+/* ════════════════════════════════════════════════════════════════════════
+   3. MOCK DATA
    ════════════════════════════════════════════════════════════════════════ */
 
 const CATEGORIES = [
@@ -217,6 +330,18 @@ const EVENTS = [
 ];
 const EVENT_BY_ID = Object.fromEntries(EVENTS.map(e => [e.id, e]));
 
+/** Consistent Braze custom-event properties for any event. */
+const eventProps = (e, extra) => Object.assign({
+  event_id:   e.id,
+  event_name: e.title,
+  category:   CAT[e.category].name,
+  venue:      e.venue,
+  city:       e.city,
+  price_from: e.price,
+  event_date: e.date,
+  days_away:  daysFromNow(e.date)
+}, extra || {});
+
 const TIERS = [
   { id:'ga',      name:'General admission', desc:'Standing / unreserved seating', mult:1.0,  perk:'Entry from 1h before doors' },
   { id:'premium', name:'Premium seated',    desc:'Reserved seat, lower tier',     mult:1.85, perk:'Priority entry + cloakroom' },
@@ -265,7 +390,7 @@ const SEED_SAVED = ['ev-03', 'ev-09', 'ev-10', 'ev-13', 'ev-19'];
 const SEED_GOING = ['ev-06', 'ev-22'];
 
 /* ════════════════════════════════════════════════════════════════════════
-   3. ICONS
+   4. ICONS
    ════════════════════════════════════════════════════════════════════════ */
 
 const ICONS = {
@@ -323,7 +448,7 @@ function Icon({ name, className = 'h-5 w-5', strokeWidth = 1.7, fill = 'none' })
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   4. BRAND + PRIMITIVES
+   5. BRAND + PRIMITIVES
    ════════════════════════════════════════════════════════════════════════ */
 
 let uidCounter = 0;
@@ -579,7 +704,7 @@ function Toast({ toast }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   5. EVENT CARDS
+   6. EVENT CARDS
    ════════════════════════════════════════════════════════════════════════ */
 
 function SaveButton({ saved, onToggle, floating = false }) {
@@ -724,7 +849,7 @@ function CategoryCard({ cat, count, active, onClick }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   6. TICKET PASS
+   7. TICKET PASS
    ════════════════════════════════════════════════════════════════════════ */
 
 function TicketPass({ ticket, onOpen, past = false }) {
@@ -843,10 +968,16 @@ function TicketDetail({ ticket, onClose, notify }) {
         </div>
 
         <div className="mt-5 grid grid-cols-2 gap-3">
-          <Button variant="outline" onClick={() => notify('Transfer link copied to clipboard', 'share')}>
+          <Button variant="outline" onClick={() => {
+            notify('Transfer link copied to clipboard', 'share');
+            bz.event('ticket_transfer_started', eventProps(ev, { order_id: ticket.orderId, quantity: ticket.qty }));
+          }}>
             <Icon name="share" className="h-4 w-4" />Transfer
           </Button>
-          <Button variant="dark" onClick={() => notify('Pass added to your wallet', 'wallet')}>
+          <Button variant="dark" onClick={() => {
+            notify('Pass added to your wallet', 'wallet');
+            bz.event('pass_added_to_wallet', eventProps(ev, { order_id: ticket.orderId }));
+          }}>
             <Icon name="wallet" className="h-4 w-4" />Add to wallet
           </Button>
         </div>
@@ -856,7 +987,7 @@ function TicketDetail({ ticket, onClose, notify }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   7. EVENT DETAIL + CHECKOUT
+   8. EVENT DETAIL + CHECKOUT
    ════════════════════════════════════════════════════════════════════════ */
 
 function EventDetail({ event, saved, onToggleSave, onClose, onBuy, notify }) {
@@ -948,7 +1079,7 @@ function EventDetail({ event, saved, onToggleSave, onClose, onBuy, notify }) {
             <Icon name="heart" className="h-4 w-4" fill={saved ? 'currentColor' : 'none'} />
             {saved ? 'Saved' : 'Save event'}
           </Button>
-          <Button variant="outline" className="sm:w-auto" onClick={() => notify('Event link copied', 'share')}>
+          <Button variant="outline" className="sm:w-auto" onClick={() => { notify('Event link copied', 'share'); bz.event('event_shared', eventProps(event)); }}>
             <Icon name="share" className="h-4 w-4" />Share
           </Button>
           <Button variant="primary" size="lg" className="flex-1" onClick={() => onBuy(event.id, tierId, qty)}>
@@ -979,8 +1110,101 @@ function InfoTile({ icon, label, value, sub }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   8. NAVIGATION
+   9. NAVIGATION
    ════════════════════════════════════════════════════════════════════════ */
+
+/** Braze Content Cards rendered as a notification inbox. */
+function CardsPanel({ cards, onCardClick, onCardDismiss, onClose, notify }) {
+  const [pushState, setPushState] = useState(() =>
+    bz.pushGranted() ? 'granted' : bz.pushBlocked() ? 'blocked' : 'ask');
+
+  // Impressions count once, when the panel is actually opened.
+  useEffect(() => { bz.cardsSeen(cards); }, []);
+
+  const askPush = () => {
+    bz.requestPush(
+      () => { setPushState('granted'); notify('Push notifications enabled', 'bell'); },
+      () => { setPushState('blocked'); notify('Notifications were declined', 'x'); }
+    );
+  };
+
+  return (
+    <div className="pop-in absolute right-0 mt-2 max-h-[70vh] w-[min(360px,calc(100vw-2rem))] overflow-y-auto rounded-2xl bg-white p-2 shadow-lift ring-1 ring-fog-200"
+         onClick={(e) => e.stopPropagation()}>
+      <div className="flex items-center justify-between px-2 py-2">
+        <h3 className="font-display text-[15px] font-bold text-ink">Notifications</h3>
+        <button onClick={onClose} aria-label="Close" className="rounded-lg p-1 text-ink-300 transition hover:bg-fog-100 hover:text-ink">
+          <Icon name="x" className="h-4 w-4" strokeWidth={2.2} />
+        </button>
+      </div>
+
+      {bz.pushSupported() && pushState === 'ask' && (
+        <div className="mb-2 rounded-xl bg-brand-50 p-3 ring-1 ring-brand-100">
+          <p className="text-[13px] font-semibold text-ink">Never miss an on-sale</p>
+          <p className="mt-0.5 text-[12.5px] leading-relaxed text-ink-500">
+            Get a push the moment tickets drop for artists you follow.
+          </p>
+          <Button variant="brand" size="sm" className="mt-2.5 w-full" onClick={askPush}>
+            <Icon name="bell" className="h-3.5 w-3.5" />Enable notifications
+          </Button>
+        </div>
+      )}
+      {pushState === 'granted' && (
+        <div className="mb-2 flex items-center gap-2 rounded-xl bg-fog-100 px-3 py-2 text-[12.5px] font-medium text-ink-500">
+          <Icon name="check" className="h-4 w-4 text-brand-600" strokeWidth={2.4} />Push notifications are on
+        </div>
+      )}
+
+      {cards.length === 0 ? (
+        <div className="px-3 py-8 text-center">
+          <span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-fog-100 text-ink-300">
+            <Icon name="bell" className="h-5 w-5" />
+          </span>
+          <p className="mt-3 text-[13.5px] font-semibold text-ink">Nothing new right now</p>
+          <p className="mx-auto mt-1 max-w-[240px] text-[12.5px] leading-relaxed text-ink-300">
+            {bz.ready
+              ? 'Content Cards from your Braze campaigns will land here.'
+              : 'The Braze SDK did not load, so Content Cards are unavailable.'}
+          </p>
+        </div>
+      ) : (
+        <ul className="space-y-1.5">
+          {cards.map(card => (
+            <li key={card.id}
+                className="group relative cursor-pointer rounded-xl p-2.5 transition hover:bg-fog-100"
+                onClick={() => onCardClick(card)}>
+              <div className="flex gap-3">
+                {card.imageUrl && (
+                  <img src={card.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-lg object-cover ring-1 ring-fog-200" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-start gap-2">
+                    {!card.viewed && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-coral-500" />}
+                    <p className="flex-1 text-[13.5px] font-semibold leading-snug text-ink">{card.title || 'Update'}</p>
+                  </div>
+                  {card.description && (
+                    <p className="mt-0.5 text-[12.5px] leading-relaxed text-ink-500">{card.description}</p>
+                  )}
+                  {card.linkText && (
+                    <span className="mt-1.5 inline-flex items-center gap-1 text-[12.5px] font-semibold text-brand-600">
+                      {card.linkText}<Icon name="arrowR" className="h-3.5 w-3.5" strokeWidth={2.1} />
+                    </span>
+                  )}
+                </div>
+                <button
+                  onClick={(e) => { e.stopPropagation(); onCardDismiss(card); }}
+                  aria-label="Dismiss"
+                  className="h-6 w-6 shrink-0 rounded-lg text-ink-200 opacity-0 transition hover:bg-white hover:text-ink group-hover:opacity-100">
+                  <Icon name="x" className="mx-auto h-3.5 w-3.5" strokeWidth={2.2} />
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 const NAV = [
   { id: 'home',    label: 'Discover',   short: 'Discover', icon: 'home' },
@@ -989,9 +1213,12 @@ const NAV = [
   { id: 'tickets', label: 'My tickets', short: 'Tickets',  icon: 'ticket' }
 ];
 
-function Navbar({ view, setView, city, setCity, savedCount, ticketCount }) {
+function Navbar({ view, setView, city, setCity, savedCount, ticketCount, cards, onCardClick, onCardDismiss, notify }) {
   const [scrolled, setScrolled] = useState(false);
   const [cityOpen, setCityOpen] = useState(false);
+  const [cardsOpen, setCardsOpen] = useState(false);
+  const unread = cards.filter(c => !c.viewed).length;
+
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 8);
     window.addEventListener('scroll', onScroll, { passive: true });
@@ -1001,6 +1228,10 @@ function Navbar({ view, setView, city, setCity, savedCount, ticketCount }) {
     const close = () => setCityOpen(false);
     if (cityOpen) { document.addEventListener('click', close); return () => document.removeEventListener('click', close); }
   }, [cityOpen]);
+  useEffect(() => {
+    const close = () => setCardsOpen(false);
+    if (cardsOpen) { document.addEventListener('click', close); return () => document.removeEventListener('click', close); }
+  }, [cardsOpen]);
 
   return (
     <header className={cx(
@@ -1058,13 +1289,29 @@ function Navbar({ view, setView, city, setCity, savedCount, ticketCount }) {
             )}
           </div>
 
-          <button className="hidden h-10 w-10 place-items-center rounded-xl bg-white text-ink-500 shadow-soft ring-1 ring-fog-200 transition hover:text-ink hover:ring-ink-200 sm:grid"
-                  aria-label="Notifications">
-            <span className="relative">
-              <Icon name="bell" className="h-[18px] w-[18px]" />
-              <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-coral-500 ring-2 ring-white" />
-            </span>
-          </button>
+          <div className="relative">
+            <button onClick={(e) => { e.stopPropagation(); setCardsOpen(o => !o); }}
+              className={cx(
+                'hidden h-10 w-10 place-items-center rounded-xl shadow-soft ring-1 transition sm:grid',
+                cardsOpen ? 'bg-ink text-white ring-ink' : 'bg-white text-ink-500 ring-fog-200 hover:text-ink hover:ring-ink-200'
+              )}
+              aria-label={unread ? `Notifications, ${unread} unread` : 'Notifications'}
+              aria-expanded={cardsOpen}>
+              <span className="relative">
+                <Icon name="bell" className="h-[18px] w-[18px]" />
+                {unread > 0 && (
+                  <span className={cx(
+                    'absolute -right-1 -top-1 min-w-[15px] rounded-full bg-coral-500 px-1 text-[9px] font-bold leading-[15px] text-white ring-2',
+                    cardsOpen ? 'ring-ink' : 'ring-white'
+                  )}>{unread}</span>
+                )}
+              </span>
+            </button>
+            {cardsOpen && (
+              <CardsPanel cards={cards} onCardClick={onCardClick} onCardDismiss={onCardDismiss}
+                          onClose={() => setCardsOpen(false)} notify={notify} />
+            )}
+          </div>
 
           <button className="flex items-center gap-2 rounded-xl bg-ink px-2 py-2 pr-3 text-white shadow-soft transition hover:bg-ink-700"
                   aria-label="Account">
@@ -1111,7 +1358,7 @@ function MobileTabBar({ view, setView, savedCount, ticketCount }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   9. VIEWS — HOME
+   10. VIEWS — HOME
    ════════════════════════════════════════════════════════════════════════ */
 
 function SearchBar({ value, onChange, onSubmit, city, big = false, placeholder = 'Search artists, teams, venues or shows' }) {
@@ -1208,7 +1455,48 @@ function Hero({ city, query, setQuery, goSearch, onPickCategory }) {
   );
 }
 
-function HomeView({ city, query, setQuery, goSearch, events, saved, toggleSave, openEvent, onPickCategory }) {
+/** Horizontal "For you" strip driven by Braze Content Cards. Renders nothing
+    when no campaign is targeting this user, so the page is unchanged by default. */
+function CardsStrip({ cards, onCardClick, onCardDismiss }) {
+  useEffect(() => { bz.cardsSeen(cards); }, [cards.length]);
+  if (!cards.length) return null;
+
+  return (
+    <section className="mx-auto max-w-8xl px-4 pt-10 sm:px-6 lg:px-10">
+      <SectionHeading eyebrow="For you" title="Picked for you"
+                      subtitle="Personalised through Braze Content Cards." />
+      <div className="no-scrollbar -mx-4 flex gap-4 overflow-x-auto px-4 pb-2 sm:mx-0 sm:px-0">
+        {cards.map(card => (
+          <article key={card.id} onClick={() => onCardClick(card)}
+            className="group relative flex w-[300px] shrink-0 cursor-pointer flex-col overflow-hidden rounded-3xl bg-white shadow-soft ring-1 ring-fog-200 transition-all duration-300 hover:-translate-y-1.5 hover:shadow-lift hover:ring-brand-200">
+            {card.imageUrl && (
+              <img src={card.imageUrl} alt="" className="h-36 w-full object-cover" />
+            )}
+            <div className="flex flex-1 flex-col p-4">
+              <div className="flex items-start gap-2">
+                {!card.viewed && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-coral-500" />}
+                <h3 className="flex-1 font-display text-[16px] font-bold leading-snug text-ink">{card.title || 'Update'}</h3>
+              </div>
+              {card.description && (
+                <p className="mt-1.5 text-[13.5px] leading-relaxed text-ink-500">{card.description}</p>
+              )}
+              <span className="mt-auto inline-flex items-center gap-1.5 pt-3 text-[13px] font-semibold text-brand-600">
+                {card.linkText || 'Find out more'}
+                <Icon name="arrowR" className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" strokeWidth={2.1} />
+              </span>
+            </div>
+            <button onClick={(e) => { e.stopPropagation(); onCardDismiss(card); }} aria-label="Dismiss"
+              className="absolute right-3 top-3 grid h-7 w-7 place-items-center rounded-full bg-white/92 text-ink-500 opacity-0 shadow-soft backdrop-blur transition hover:text-ink group-hover:opacity-100">
+              <Icon name="x" className="h-3.5 w-3.5" strokeWidth={2.2} />
+            </button>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function HomeView({ city, query, setQuery, goSearch, events, saved, toggleSave, openEvent, onPickCategory, cards, onCardClick, onCardDismiss }) {
   const inCity = events.filter(e => e.city === city);
   const pool = inCity.length ? inCity : events;
 
@@ -1220,6 +1508,8 @@ function HomeView({ city, query, setQuery, goSearch, events, saved, toggleSave, 
   return (
     <>
       <Hero city={city} query={query} setQuery={setQuery} goSearch={goSearch} />
+
+      <CardsStrip cards={cards} onCardClick={onCardClick} onCardDismiss={onCardDismiss} />
 
       {/* Categories */}
       <section className="mx-auto max-w-8xl px-4 py-12 sm:px-6 sm:py-16 lg:px-10">
@@ -1288,8 +1578,14 @@ function HomeView({ city, query, setQuery, goSearch, events, saved, toggleSave, 
                 €7/month, cancel whenever.
               </p>
               <div className="mt-6 flex flex-wrap gap-3">
-                <Button variant="primary" size="lg">Start free month</Button>
-                <Button variant="light" size="lg">How it works</Button>
+                <Button variant="primary" size="lg"
+                        onClick={() => bz.event('membership_cta_clicked', { cta: 'start_free_month', placement: 'home_banner' })}>
+                  Start free month
+                </Button>
+                <Button variant="light" size="lg"
+                        onClick={() => bz.event('membership_cta_clicked', { cta: 'how_it_works', placement: 'home_banner' })}>
+                  How it works
+                </Button>
               </div>
             </div>
             <div className="grid w-full max-w-sm gap-3 lg:w-auto">
@@ -1335,7 +1631,7 @@ function HomeView({ city, query, setQuery, goSearch, events, saved, toggleSave, 
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   10. VIEWS — SEARCH
+   11. VIEWS — SEARCH
    ════════════════════════════════════════════════════════════════════════ */
 
 const DATE_FILTERS = [
@@ -1485,6 +1781,27 @@ function SearchView({ query, setQuery, filters, setFilters, sort, setSort, saved
   const results = useMemo(() => applyFilters(EVENTS, { ...filters, query }, sort), [filters, query, sort]);
   const counts = useMemo(() => Object.fromEntries(CATEGORIES.map(c => [c.id, EVENTS.filter(e => e.category === c.id).length])), []);
 
+  // Braze: one search_performed per settled query/filter combination, not per
+  // keystroke. Skips the bare default state so landing on the tab isn't a search.
+  useEffect(() => {
+    const touched = query.trim() || filters.categories.length || filters.date !== 'any'
+                 || filters.maxPrice < 250 || filters.city !== 'all';
+    if (!touched) return;
+    const t = setTimeout(() => {
+      bz.event('search_performed', {
+        query: query.trim(),
+        results_count: results.length,
+        categories: filters.categories.map(c => CAT[c].name).join(', '),
+        date_filter: filters.date,
+        max_price: filters.maxPrice,
+        city: filters.city,
+        sort_by: sort,
+        zero_results: results.length === 0
+      });
+    }, 900);
+    return () => clearTimeout(t);
+  }, [query, filters, sort, results.length]);
+
   const activeChips = [
     ...filters.categories.map(c => ({ key: 'cat:' + c, label: CAT[c].name, clear: () => setFilters(f => ({ ...f, categories: f.categories.filter(x => x !== c) })) })),
     filters.date !== 'any' && { key: 'date', label: DATE_FILTERS.find(f => f.id === filters.date).label, clear: () => setFilters(f => ({ ...f, date: 'any' })) },
@@ -1598,7 +1915,7 @@ function EmptyState({ icon, title, body, action }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   11. VIEWS — MY EVENTS
+   12. VIEWS — MY EVENTS
    ════════════════════════════════════════════════════════════════════════ */
 
 function Tabs({ tabs, value, onChange }) {
@@ -1737,7 +2054,7 @@ function StatCard({ icon, label, value, sub }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   12. VIEWS — MY TICKETS
+   13. VIEWS — MY TICKETS
    ════════════════════════════════════════════════════════════════════════ */
 
 function MyTicketsView({ tickets, openTicket, goSearch, notify }) {
@@ -1761,7 +2078,11 @@ function MyTicketsView({ tickets, openTicket, goSearch, notify }) {
             Your digital wallet. Every pass works offline — open it at the gate and let them scan the code.
           </p>
         </div>
-        <Button variant="outline" onClick={() => notify('All passes synced to this device', 'refresh')}>
+        <Button variant="outline" onClick={() => {
+          notify('All passes synced to this device', 'refresh');
+          bz.event('wallet_synced', { tickets: tickets.length, seats: totalSeats });
+          bz.flush();
+        }}>
           <Icon name="refresh" className="h-4 w-4" />Sync wallet
         </Button>
       </div>
@@ -1839,7 +2160,7 @@ function MyTicketsView({ tickets, openTicket, goSearch, notify }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   13. FOOTER
+   14. FOOTER
    ════════════════════════════════════════════════════════════════════════ */
 
 function Footer({ setView }) {
@@ -1880,7 +2201,13 @@ function Footer({ setView }) {
           ))}
         </div>
         <div className="mt-12 flex flex-col items-start justify-between gap-4 border-t border-fog-200 pt-6 sm:flex-row sm:items-center">
-          <p className="text-[13px] text-ink-300">© 2026 Ticketboss — a fictitious demo marketplace.</p>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <p className="text-[13px] text-ink-300">© 2026 Ticketboss — a fictitious demo marketplace.</p>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-fog-100 px-2.5 py-1 text-[11px] font-semibold text-ink-300 ring-1 ring-fog-200">
+              <span className={cx('h-1.5 w-1.5 rounded-full', bz.ready ? 'bg-emerald-500' : 'bg-ink-200')} />
+              Braze SDK {bz.version} {bz.ready ? 'connected' : 'unavailable'}
+            </span>
+          </div>
           <div className="flex flex-wrap gap-5 text-[13px] text-ink-300">
             {['Privacy', 'Terms', 'Cookies', 'Sitemap'].map(l => (
               <a key={l} href="#" onClick={(e) => e.preventDefault()} className="transition hover:text-ink">{l}</a>
@@ -1893,7 +2220,7 @@ function Footer({ setView }) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   14. APP
+   15. APP
    ════════════════════════════════════════════════════════════════════════ */
 
 const DEFAULT_FILTERS = { categories: [], date: 'any', maxPrice: 250, city: 'all' };
@@ -1912,12 +2239,35 @@ function App() {
   const [activeEvent, setActiveEvent] = useState(null);
   const [activeTicket, setActiveTicket] = useState(null);
   const [toast, setToast] = useState(null);
+  const [cards, setCards] = useState([]);
   const toastTimer = useRef(null);
 
   useEffect(() => store.set('saved', saved), [saved]);
   useEffect(() => store.set('going', going), [going]);
   useEffect(() => store.set('tickets', tickets), [tickets]);
   useEffect(() => store.set('city', city), [city]);
+
+  /* ── Braze: Content Cards subscription ─────────────────────────────── */
+  useEffect(() => bz.onCards(setCards), []);
+
+  /* ── Braze: keep the user profile in sync with app state ───────────── */
+  useEffect(() => {
+    const spend = tickets.reduce((s, t) => s + t.total, 0);
+    const counts = {};
+    saved.forEach(id => {
+      const e = EVENT_BY_ID[id];
+      if (e) counts[e.category] = (counts[e.category] || 0) + 1;
+    });
+    const favourite = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+    bz.attrs({
+      saved_events:    saved.length,
+      going_events:    going.length,
+      tickets_owned:   tickets.reduce((s, t) => s + t.qty, 0),
+      lifetime_spend:  +spend.toFixed(2),
+      favourite_category: favourite ? CAT[favourite].name : null,
+      home_city:       city
+    });
+  }, [saved, going, tickets, city]);
 
   const notify = useCallback((message, icon = 'check') => {
     setToast({ message, icon, id: Date.now() });
@@ -1926,14 +2276,40 @@ function App() {
   }, []);
 
   const setView = useCallback((v) => {
-    setViewRaw(v);
+    setViewRaw(prev => {
+      if (prev !== v) bz.event('screen_viewed', { screen: v, from: prev });
+      return v;
+    });
     window.scrollTo({ top: 0, behavior: 'auto' });
+  }, []);
+
+  const changeCity = useCallback((c) => {
+    setCity(c);
+    bz.homeCity(c);
+    bz.event('city_changed', { city: c });
+  }, []);
+
+  const openEvent = useCallback((e) => {
+    setActiveEvent(e);
+    if (e) bz.event('event_viewed', eventProps(e, { percent_sold: Math.round(e.sold * 100) }));
+  }, []);
+
+  const openTicket = useCallback((t) => {
+    setActiveTicket(t);
+    if (t) {
+      const ev = EVENT_BY_ID[t.eventId];
+      bz.event('ticket_pass_opened', eventProps(ev, {
+        order_id: t.orderId, tier: t.tierName, quantity: t.qty
+      }));
+    }
   }, []);
 
   const toggleSave = useCallback((id) => {
     setSaved(s => {
       const has = s.includes(id);
       notify(has ? 'Removed from saved events' : 'Saved to My events', has ? 'trash' : 'heart');
+      const ev = EVENT_BY_ID[id];
+      if (ev) bz.event(has ? 'event_unsaved' : 'event_saved', eventProps(ev));
       return has ? s.filter(x => x !== id) : [...s, id];
     });
   }, [notify]);
@@ -1942,16 +2318,31 @@ function App() {
     setGoing(g => {
       const has = g.includes(id);
       notify(has ? 'No longer marked as going' : "Marked as going — we'll remind you", 'check');
+      const ev = EVENT_BY_ID[id];
+      if (ev) bz.event(has ? 'unmarked_going' : 'marked_going', eventProps(ev));
       return has ? g.filter(x => x !== id) : [...g, id];
     });
   }, [notify]);
 
   const buy = useCallback((eventId, tierId, qty) => {
     const t = buildTicket(eventId, tierId, qty, new Date().toISOString());
+    const ev = EVENT_BY_ID[eventId];
+    const tier = TIERS.find(x => x.id === tierId) || TIERS[0];
+    // Braze revenue = unitPrice × quantity, so send the all-in per-ticket price.
+    const unitAllIn = +(ev.price * tier.mult + FEE).toFixed(2);
+
     setTickets(list => [t, ...list.filter(x => x.id !== t.id)]);
     setActiveEvent(null);
     setView('tickets');
     notify(`${qty} ${qty > 1 ? 'tickets' : 'ticket'} added to your wallet`, 'ticket');
+
+    bz.purchase(eventId, unitAllIn, qty, eventProps(ev, {
+      tier: tier.name, order_id: t.orderId, section: t.section, row: t.row
+    }));
+    bz.event('ticket_purchased', eventProps(ev, {
+      tier: tier.name, quantity: qty, order_total: t.total, order_id: t.orderId
+    }));
+    bz.flush();   // demo: surface the purchase in Braze immediately
   }, [notify, setView]);
 
   const goSearch = useCallback(() => setView('search'), [setView]);
@@ -1960,31 +2351,45 @@ function App() {
     setFilters({ ...DEFAULT_FILTERS, categories: [catId], city });
     setQuery('');
     setView('search');
+    bz.event('category_browsed', { category: CAT[catId].name, city });
   }, [city, setView]);
 
   const resetFilters = useCallback(() => { setFilters(DEFAULT_FILTERS); setQuery(''); }, []);
 
+  const onCardClick = useCallback((card) => {
+    bz.cardClick(card);
+    bz.event('content_card_clicked', { card_id: card.id, title: card.title || '' });
+    if (card.url) window.open(card.url, '_blank', 'noopener');
+  }, []);
+
+  const onCardDismiss = useCallback((card) => {
+    bz.cardDismiss(card);
+    setCards(cs => cs.filter(c => c.id !== card.id));
+  }, []);
+
   return (
     <div className="min-h-screen bg-fog pb-20 lg:pb-0">
-      <Navbar view={view} setView={setView} city={city} setCity={setCity}
-              savedCount={saved.length} ticketCount={tickets.length} />
+      <Navbar view={view} setView={setView} city={city} setCity={changeCity}
+              savedCount={saved.length} ticketCount={tickets.length}
+              cards={cards} onCardClick={onCardClick} onCardDismiss={onCardDismiss} notify={notify} />
 
       <main key={view} className="fade-up">
         {view === 'home' && (
           <HomeView city={city} query={query} setQuery={setQuery} goSearch={goSearch} events={EVENTS}
-                    saved={saved} toggleSave={toggleSave} openEvent={setActiveEvent} onPickCategory={pickCategory} />
+                    saved={saved} toggleSave={toggleSave} openEvent={openEvent} onPickCategory={pickCategory}
+                    cards={cards} onCardClick={onCardClick} onCardDismiss={onCardDismiss} />
         )}
         {view === 'search' && (
           <SearchView query={query} setQuery={setQuery} filters={filters} setFilters={setFilters}
                       sort={sort} setSort={setSort} saved={saved} toggleSave={toggleSave}
-                      openEvent={setActiveEvent} resetFilters={resetFilters} />
+                      openEvent={openEvent} resetFilters={resetFilters} />
         )}
         {view === 'events' && (
           <MyEventsView saved={saved} going={going} toggleSave={toggleSave} toggleGoing={toggleGoing}
-                        openEvent={setActiveEvent} goSearch={goSearch} />
+                        openEvent={openEvent} goSearch={goSearch} />
         )}
         {view === 'tickets' && (
-          <MyTicketsView tickets={tickets} openTicket={setActiveTicket} goSearch={goSearch} notify={notify} />
+          <MyTicketsView tickets={tickets} openTicket={openTicket} goSearch={goSearch} notify={notify} />
         )}
       </main>
 
