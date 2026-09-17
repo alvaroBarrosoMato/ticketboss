@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Ticketboss">
+  <defs>
+    <linearGradient id="tbGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5B76F5"/>
+      <stop offset="100%" stop-color="#2F4BE0"/>
+    </linearGradient>
+    <mask id="tbMask">
+      <rect width="64" height="64" fill="#000"/>
+      <g transform="translate(32 32) rotate(-35)">
+        <path d="M -15,-10 A 15 15 0 0 1 15,-10 L 15,20 A 5 5 0 0 1 10,25 L -10,25 A 5 5 0 0 1 -15,20 Z" fill="#fff"/>
+        <circle cx="0" cy="-10" r="6.4" fill="#000"/>
+        <circle cx="-15" cy="6" r="3.4" fill="#000"/>
+        <circle cx="-15" cy="14.5" r="3.4" fill="#000"/>
+      </g>
+    </mask>
+  </defs>
+  <g mask="url(#tbMask)">
+    <rect width="64" height="64" fill="url(#tbGrad)"/>
+    <g transform="translate(32 32) rotate(-35)">
+      <path d="M -15,-10 A 15 15 0 0 1 15,-10 L 15,2.5 L -15,2.5 Z" fill="#FFFFFF" opacity="0.16"/>
+      <path d="M 4,-4.5 L 13.5,5 L 4,14.5 L -5.5,5 Z" fill="#FF6B35"/>
+    </g>
+  </g>
+</svg>
